@@ -1,0 +1,19 @@
+# Node
+node_modules/
+.env
+
+# Build
+build/
+dist/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Database
+*.sqlite
+
+# Cache
+.cache/
