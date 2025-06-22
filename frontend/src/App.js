@@ -192,9 +192,7 @@ function App() {
                   path="/reports/create"
                   element={
                     <ProtectedRoute>
-                      <MainLayout>
-                        <CreateReport />
-                      </MainLayout>
+                      <CreateReport />
                     </ProtectedRoute>
                   }
                 />

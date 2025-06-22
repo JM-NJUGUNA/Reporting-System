@@ -1,363 +1,242 @@
-const express = require('express');
-const multer = require('multer');
-const path = require('path');
-const { body, validationResult } = require('express-validator');
-const { Report, ReportTemplate, User } = require('../models');
-const { authenticateToken, requireRole } = require('../middleware/auth');
-const { generateReport } = require('../services/reportGenerator');
-const { uploadToStorage } = require('../services/fileService');
-const { logActivity } = require('../utils/auditLogger');
+const { DataTypes } = require('sequelize');
 
-const router = express.Router();
-
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const upload = multer({ 
-  storage: storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = /xlsx|xls|csv|pdf/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-    
-    if (mimetype && extname) {
-      return cb(null, true);
-    } else {
-      cb(new Error('Only Excel, CSV, and PDF files are allowed'));
+module.exports = (sequelize) => {
+  const Report = sequelize.define('Report', {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true
+    },
+    title: {
+      type: DataTypes.STRING(200),
+      allowNull: false,
+      validate: {
+        len: [5, 200]
+      }
+    },
+    type: {
+      type: DataTypes.ENUM('monthly', 'quarterly', 'annual', 'custom'),
+      allowNull: false,
+      defaultValue: 'monthly'
+    },
+    status: {
+      type: DataTypes.ENUM('pending', 'generating', 'completed', 'failed'),
+      allowNull: false,
+      defaultValue: 'pending'
+    },
+    description: {
+      type: DataTypes.TEXT,
+      allowNull: true
+    },
+    data: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      comment: 'Report data and metrics'
+    },
+    templateId: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'ReportTemplates',
+        key: 'id'
+      }
+    },
+    fileUrl: {
+      type: DataTypes.STRING(500),
+      allowNull: true,
+      comment: 'Path to generated report file'
+    },
+    fileSize: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      comment: 'File size in bytes'
+    },
+    generatedBy: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      references: {
+        model: 'Users',
+        key: 'id'
+      }
+    },
+    approvedBy: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'Users',
+        key: 'id'
+      }
+    },
+    approvedAt: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    complianceScore: {
+      type: DataTypes.DECIMAL(5, 2),
+      allowNull: true,
+      validate: {
+        min: 0,
+        max: 100
+      }
+    },
+    sasraSubmissionId: {
+      type: DataTypes.STRING(100),
+      allowNull: true,
+      comment: 'SASRA submission reference ID'
+    },
+    submittedAt: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    dueDate: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      comment: 'Report due date for compliance'
+    },
+    metadata: {
+      type: DataTypes.JSONB,
+      allowNull: true,
+      comment: 'Additional metadata for the report'
+    },
+    version: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 1,
+      comment: 'Report version number'
+    },
+    isActive: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: true
     }
-  }
-});
-
-// Get all reports
-router.get('/', authenticateToken, async (req, res) => {
-  try {
-    const { page = 1, limit = 10, status, type, dateFrom, dateTo } = req.query;
-    const offset = (page - 1) * limit;
-    
-    const whereClause = {};
-    if (status) whereClause.status = status;
-    if (type) whereClause.type = type;
-    if (dateFrom && dateTo) {
-      whereClause.createdAt = {
-        [Op.between]: [new Date(dateFrom), new Date(dateTo)]
-      };
-    }
-
-    const reports = await Report.findAndCountAll({
-      where: whereClause,
-      limit: parseInt(limit),
-      offset: parseInt(offset),
-      include: [
-        {
-          model: User,
-          as: 'creator',
-          attributes: ['id', 'firstName', 'lastName', 'email']
+  }, {
+    tableName: 'reports',
+    timestamps: true,
+    paranoid: true, // Soft deletes
+    indexes: [
+      {
+        name: 'idx_reports_type',
+        fields: ['type']
+      },
+      {
+        name: 'idx_reports_status',
+        fields: ['status']
+      },
+      {
+        name: 'idx_reports_generated_by',
+        fields: ['generatedBy']
+      },
+      {
+        name: 'idx_reports_created_at',
+        fields: ['createdAt']
+      },
+      {
+        name: 'idx_reports_due_date',
+        fields: ['dueDate']
+      },
+      {
+        name: 'idx_reports_compliance_score',
+        fields: ['complianceScore']
+      }
+    ],
+    hooks: {
+      beforeCreate: (report, options) => {
+        // Set due date if not provided and type is monthly/quarterly
+        if (!report.dueDate) {
+          const now = new Date();
+          switch (report.type) {
+            case 'monthly':
+              report.dueDate = new Date(now.getFullYear(), now.getMonth() + 1, 15);
+              break;
+            case 'quarterly':
+              const quarter = Math.floor(now.getMonth() / 3);
+              report.dueDate = new Date(now.getFullYear(), (quarter + 1) * 3, 30);
+              break;
+            case 'annual':
+              report.dueDate = new Date(now.getFullYear() + 1, 2, 31); // March 31st next year
+              break;
+          }
         }
+      }
+    }
+  });
+
+  // Define associations
+  Report.associate = (models) => {
+    // Report belongs to User (creator)
+    Report.belongsTo(models.User, {
+      foreignKey: 'generatedBy',
+      as: 'creator'
+    });
+
+    // Report belongs to User (approver)
+    Report.belongsTo(models.User, {
+      foreignKey: 'approvedBy',
+      as: 'approver'
+    });
+
+    // Report belongs to ReportTemplate
+    Report.belongsTo(models.ReportTemplate, {
+      foreignKey: 'templateId',
+      as: 'reportTemplate'
+    });
+  };
+
+  // Instance methods
+  Report.prototype.isOverdue = function() {
+    return this.dueDate && new Date() > this.dueDate && this.status !== 'completed';
+  };
+
+  Report.prototype.canBeEdited = function() {
+    return ['pending', 'failed'].includes(this.status);
+  };
+
+  Report.prototype.canBeApproved = function() {
+    return this.status === 'completed' && !this.approvedBy;
+  };
+
+  Report.prototype.canBeSubmitted = function() {
+    return this.status === 'completed' && this.approvedBy && !this.submittedAt;
+  };
+
+  // Class methods
+  Report.findOverdue = function() {
+    return this.findAll({
+      where: {
+        dueDate: {
+          [sequelize.Sequelize.Op.lt]: new Date()
+        },
+        status: {
+          [sequelize.Sequelize.Op.ne]: 'completed'
+        }
+      }
+    });
+  };
+
+  Report.findByComplianceScore = function(minScore) {
+    return this.findAll({
+      where: {
+        complianceScore: {
+          [sequelize.Sequelize.Op.gte]: minScore
+        }
+      }
+    });
+  };
+
+  Report.getStats = async function() {
+    const stats = await this.findAll({
+      attributes: [
+        'type',
+        'status',
+        [sequelize.Sequelize.fn('COUNT', sequelize.Sequelize.col('id')), 'count'],
+        [sequelize.Sequelize.fn('AVG', sequelize.Sequelize.col('complianceScore')), 'avgComplianceScore']
       ],
-      order: [['createdAt', 'DESC']]
+      group: ['type', 'status'],
+      raw: true
     });
 
-    res.json({
-      success: true,
-      data: reports.rows,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: reports.count,
-        pages: Math.ceil(reports.count / limit)
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching reports',
-      error: error.message
-    });
-  }
-});
+    return stats;
+  };
 
-// Create new report
-router.post('/', 
-  authenticateToken,
-  requireRole(['admin', 'manager', 'analyst']),
-  [
-    body('title').notEmpty().withMessage('Title is required'),
-    body('type').isIn(['financial', 'compliance', 'operational', 'custom']).withMessage('Invalid report type'),
-    body('description').optional().isLength({ max: 500 }).withMessage('Description too long')
-  ],
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({
-          success: false,
-          message: 'Validation errors',
-          errors: errors.array()
-        });
-      }
-
-      const { title, type, description, templateId, parameters } = req.body;
-
-      const report = await Report.create({
-        title,
-        type,
-        description,
-        templateId,
-        parameters: JSON.stringify(parameters),
-        createdBy: req.user.id,
-        status: 'pending'
-      });
-
-      // Log activity
-      await logActivity(req.user.id, 'report_created', {
-        reportId: report.id,
-        title: report.title
-      });
-
-      // Start report generation in background
-      generateReport(report.id).catch(console.error);
-
-      res.status(201).json({
-        success: true,
-        message: 'Report creation initiated',
-        data: report
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: 'Error creating report',
-        error: error.message
-      });
-    }
-  }
-);
-
-// Get specific report
-router.get('/:id', authenticateToken, async (req, res) => {
-  try {
-    const report = await Report.findByPk(req.params.id, {
-      include: [
-        {
-          model: User,
-          as: 'creator',
-          attributes: ['id', 'firstName', 'lastName', 'email']
-        }
-      ]
-    });
-
-    if (!report) {
-      return res.status(404).json({
-        success: false,
-        message: 'Report not found'
-      });
-    }
-
-    res.json({
-      success: true,
-      data: report
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching report',
-      error: error.message
-    });
-  }
-});
-
-// Update report
-router.put('/:id',
-  authenticateToken,
-  requireRole(['admin', 'manager']),
-  [
-    body('title').optional().notEmpty().withMessage('Title cannot be empty'),
-    body('status').optional().isIn(['pending', 'processing', 'completed', 'failed']).withMessage('Invalid status')
-  ],
-  async (req, res) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({
-          success: false,
-          message: 'Validation errors',
-          errors: errors.array()
-        });
-      }
-
-      const report = await Report.findByPk(req.params.id);
-      if (!report) {
-        return res.status(404).json({
-          success: false,
-          message: 'Report not found'
-        });
-      }
-
-      await report.update(req.body);
-
-      await logActivity(req.user.id, 'report_updated', {
-        reportId: report.id,
-        changes: req.body
-      });
-
-      res.json({
-        success: true,
-        message: 'Report updated successfully',
-        data: report
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: 'Error updating report',
-        error: error.message
-      });
-    }
-  }
-);
-
-// Delete report
-router.delete('/:id',
-  authenticateToken,
-  requireRole(['admin', 'manager']),
-  async (req, res) => {
-    try {
-      const report = await Report.findByPk(req.params.id);
-      if (!report) {
-        return res.status(404).json({
-          success: false,
-          message: 'Report not found'
-        });
-      }
-
-      await report.destroy();
-
-      await logActivity(req.user.id, 'report_deleted', {
-        reportId: req.params.id,
-        title: report.title
-      });
-
-      res.json({
-        success: true,
-        message: 'Report deleted successfully'
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: 'Error deleting report',
-        error: error.message
-      });
-    }
-  }
-);
-
-// Upload data file for report
-router.post('/:id/upload',
-  authenticateToken,
-  upload.single('dataFile'),
-  async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({
-          success: false,
-          message: 'No file uploaded'
-        });
-      }
-
-      const report = await Report.findByPk(req.params.id);
-      if (!report) {
-        return res.status(404).json({
-          success: false,
-          message: 'Report not found'
-        });
-      }
-
-      // Process uploaded file
-      const fileUrl = await uploadToStorage(req.file);
-      
-      await report.update({
-        dataFile: fileUrl,
-        status: 'processing'
-      });
-
-      await logActivity(req.user.id, 'file_uploaded', {
-        reportId: report.id,
-        filename: req.file.originalname
-      });
-
-      res.json({
-        success: true,
-        message: 'File uploaded successfully',
-        data: {
-          filename: req.file.originalname,
-          url: fileUrl
-        }
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: 'Error uploading file',
-        error: error.message
-      });
-    }
-  }
-);
-
-// Download report
-router.get('/:id/download', authenticateToken, async (req, res) => {
-  try {
-    const report = await Report.findByPk(req.params.id);
-    if (!report) {
-      return res.status(404).json({
-        success: false,
-        message: 'Report not found'
-      });
-    }
-
-    if (report.status !== 'completed' || !report.outputFile) {
-      return res.status(400).json({
-        success: false,
-        message: 'Report not ready for download'
-      });
-    }
-
-    // Set appropriate headers for file download
-    res.setHeader('Content-Disposition', `attachment; filename="${report.title}.pdf"`);
-    res.setHeader('Content-Type', 'application/pdf');
-
-    // Stream the file
-    const fs = require('fs');
-    const filePath = path.join(__dirname, '../', report.outputFile);
-    
-    if (fs.existsSync(filePath)) {
-      const fileStream = fs.createReadStream(filePath);
-      fileStream.pipe(res);
-      
-      await logActivity(req.user.id, 'report_downloaded', {
-        reportId: report.id
-      });
-    } else {
-      res.status(404).json({
-        success: false,
-        message: 'Report file not found'
-      });
-    }
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error downloading report',
-      error: error.message
-    });
-  }
-});
-
-module.exports = router;
+  return Report;
+}; 
